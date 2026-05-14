@@ -1,0 +1,255 @@
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <WebServer.h>
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+
+// ─── Config ────────────────────────────────────────────────────────
+const char* WIFI_SSID  = "yourssidname";
+const char* WIFI_PASS  = "yourwifipasswprd";
+const char* API_KEY    = "yourapikey";
+const char* serverName = "www.circuitdigest.cloud";
+const char* serverPath = "/api/v1/currency-detection/detect";
+const int   serverPort = 443;
+
+#define TRIGGER_BTN 13
+
+// ─── AI-Thinker ESP32-CAM Pins ─────────────────────────────────────
+#define PWDN_GPIO_NUM  32
+#define RESET_GPIO_NUM -1
+#define XCLK_GPIO_NUM   0
+#define SIOD_GPIO_NUM  26
+#define SIOC_GPIO_NUM  27
+#define Y9_GPIO_NUM    35
+#define Y8_GPIO_NUM    34
+#define Y7_GPIO_NUM    39
+#define Y6_GPIO_NUM    36
+#define Y5_GPIO_NUM    21
+#define Y4_GPIO_NUM    19
+#define Y3_GPIO_NUM    18
+#define Y2_GPIO_NUM     5
+#define VSYNC_GPIO_NUM 25
+#define HREF_GPIO_NUM  23
+#define PCLK_GPIO_NUM  22
+
+// ─── Globals ───────────────────────────────────────────────────────
+WiFiClientSecure  client;
+WebServer         previewServer(80);
+unsigned long     lastTrigger    = 0;
+volatile bool     buttonPressed  = false;  // pauses stream during detection
+SemaphoreHandle_t cameraMutex;
+
+// ─── Camera Init ───────────────────────────────────────────────────
+void initCamera() {
+  camera_config_t cfg = {};
+  cfg.ledc_channel = LEDC_CHANNEL_0; cfg.ledc_timer = LEDC_TIMER_0;
+  cfg.pin_d0 = Y2_GPIO_NUM;   cfg.pin_d1 = Y3_GPIO_NUM;
+  cfg.pin_d2 = Y4_GPIO_NUM;   cfg.pin_d3 = Y5_GPIO_NUM;
+  cfg.pin_d4 = Y6_GPIO_NUM;   cfg.pin_d5 = Y7_GPIO_NUM;
+  cfg.pin_d6 = Y8_GPIO_NUM;   cfg.pin_d7 = Y9_GPIO_NUM;
+  cfg.pin_xclk     = XCLK_GPIO_NUM;  cfg.pin_pclk     = PCLK_GPIO_NUM;
+  cfg.pin_vsync    = VSYNC_GPIO_NUM; cfg.pin_href     = HREF_GPIO_NUM;
+  cfg.pin_sscb_sda = SIOD_GPIO_NUM;  cfg.pin_sscb_scl = SIOC_GPIO_NUM;
+  cfg.pin_pwdn     = PWDN_GPIO_NUM;  cfg.pin_reset    = RESET_GPIO_NUM;
+  cfg.xclk_freq_hz = 20000000;
+  cfg.pixel_format = PIXFORMAT_JPEG;
+  cfg.frame_size   = FRAMESIZE_VGA;
+  cfg.jpeg_quality = 10;
+  cfg.fb_count     = 2;
+
+  if (esp_camera_init(&cfg) != ESP_OK) {
+    Serial.println("Camera init failed!"); while (1) delay(1000);
+  }
+  sensor_t* s = esp_camera_sensor_get();
+  s->set_brightness(s, 1); s->set_contrast(s, 2);
+  s->set_saturation(s, 0); s->set_whitebal(s, 1);
+  s->set_exposure_ctrl(s, 1); s->set_gain_ctrl(s, 1);
+  s->set_aec2(s, 1); s->set_ae_level(s, 1);
+  Serial.println("Camera initialized.");
+}
+
+// ─── Web Server Task (Core 0) ───────────────────────────────────────
+void webServerTask(void* param) {
+  while (true) {
+    previewServer.handleClient();
+    vTaskDelay(1);
+  }
+}
+
+// ─── Root Page ─────────────────────────────────────────────────────
+void handleRoot() {
+  previewServer.send(200, "text/html",
+    "<html><head>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<script>"
+    "window.onload=function(){"
+    "  var img=document.getElementById('s');"
+    "  img.onerror=function(){setTimeout(function(){img.src='/stream?t='+Date.now();},3000);};"
+    "};"
+    "</script>"
+    "</head>"
+    "<body style='background:#000;text-align:center'>"
+    "<h2 style='color:#fff'>Currency Detection</h2>"
+    "<p style='color:#aaa'>Press the physical button to capture &amp; detect</p>"
+    "<img id='s' src='/stream' style='width:100%;max-width:640px'>"
+    "</body></html>"
+  );
+}
+
+// ─── MJPEG Stream (runs inside webServerTask on Core 0) ────────────
+void handleStream() {
+  WiFiClient streamClient = previewServer.client();
+  streamClient.println("HTTP/1.1 200 OK");
+  streamClient.println("Content-Type: multipart/x-mixed-replace; boundary=frame");
+  streamClient.println();
+
+  while (streamClient.connected()) {
+    // Pause stream while button detection is running (don't touch camera)
+    if (buttonPressed) {
+      vTaskDelay(100 / portTICK_PERIOD_MS);
+      continue;
+    }
+
+    if (xSemaphoreTake(cameraMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+      camera_fb_t* fb = esp_camera_fb_get();
+      xSemaphoreGive(cameraMutex);
+
+      if (fb) {
+        streamClient.println("--frame");
+        streamClient.println("Content-Type: image/jpeg");
+        streamClient.println("Content-Length: " + String(fb->len));
+        streamClient.println();
+        streamClient.write(fb->buf, fb->len);
+        streamClient.println();
+        esp_camera_fb_return(fb);
+      }
+    }
+    vTaskDelay(50 / portTICK_PERIOD_MS);  // ~20 fps
+  }
+}
+
+// ─── API Upload ─────────────────────────────────────────────────────
+String sendImageToAPI(camera_fb_t* fb) {
+  Serial.println("Connecting to server...");
+  if (!client.connect(serverName, serverPort)) {
+    Serial.println("Connection failed!");
+    return "Connection failed";
+  }
+  Serial.println("Connected!");
+
+  String boundary  = "----ESP32Boundary";
+  String head      = "--" + boundary + "\r\n"
+                     "Content-Disposition: form-data; name=\"imageFile\"; filename=\"snap.jpg\"\r\n"
+                     "Content-Type: image/jpeg\r\n\r\n";
+  String tail      = "\r\n--" + boundary + "--\r\n";
+  int    contentLen = head.length() + fb->len + tail.length();
+
+  client.println("POST " + String(serverPath) + " HTTP/1.1");
+  client.println("Host: " + String(serverName));
+  client.println("X-API-Key: " + String(API_KEY));
+  client.println("Content-Type: multipart/form-data; boundary=" + boundary);
+  client.println("Content-Length: " + String(contentLen));
+  client.println("Connection: close");
+  client.println();
+  client.print(head);
+  client.write(fb->buf, fb->len);
+  client.print(tail);
+
+  Serial.println("Image sent! Waiting for response...");
+  long t = millis();
+  while (!client.available()) {
+    if (millis() - t > 15000) { client.stop(); return "Timeout"; }
+    delay(10);
+  }
+
+  String response = "";
+  while (client.connected() || client.available()) {
+    if (client.available()) response += (char)client.read();
+    else delay(1);
+  }
+  client.stop();
+
+  int j = response.indexOf("\r\n\r\n");
+  return (j != -1) ? response.substring(j + 4) : response;
+}
+
+// ─── Detect Currency (runs on Core 1 inside loop()) ─────────────────
+void detectCurrency() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi disconnected! Reconnecting...");
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    int tries = 0;
+    while (WiFi.status() != WL_CONNECTED && tries < 20) {
+      delay(500); Serial.print("."); tries++;
+    }
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("WiFi reconnect failed!"); return;
+    }
+    Serial.println("WiFi reconnected!");
+  }
+
+  // Take mutex — stream will pause (buttonPressed=true already set)
+  xSemaphoreTake(cameraMutex, portMAX_DELAY);
+
+  // Warm-up frame — let AEC settle
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (fb) esp_camera_fb_return(fb);
+  delay(200);
+
+  // Real capture
+  fb = esp_camera_fb_get();
+  xSemaphoreGive(cameraMutex);
+
+  if (!fb) { Serial.println("Capture failed!"); return; }
+
+  Serial.println("Photo captured! Sending to API...");
+  String result = sendImageToAPI(fb);
+  esp_camera_fb_return(fb);
+
+  Serial.println("=== Currency Detection Result ===");
+  Serial.println(result);
+  Serial.println("================================");
+}
+
+// ─── Setup ──────────────────────────────────────────────────────────
+void setup() {
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // Disable brownout detector
+  Serial.begin(115200);
+  delay(500);
+
+  cameraMutex = xSemaphoreCreateMutex();
+  pinMode(TRIGGER_BTN, INPUT_PULLUP);
+
+  initCamera();
+
+  client.setInsecure();  // skip TLS cert check
+
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("Connecting to WiFi");
+  while (!WiFi.isConnected()) { delay(500); Serial.print("."); }
+  Serial.println("\nConnected: " + WiFi.localIP().toString());
+  Serial.println("Preview at: http://" + WiFi.localIP().toString());
+
+  previewServer.on("/",       handleRoot);
+  previewServer.on("/stream", handleStream);
+  previewServer.begin();
+
+  // Web server + stream on Core 0; loop() on Core 1
+  xTaskCreatePinnedToCore(webServerTask, "webTask", 8192, NULL, 1, NULL, 0);
+}
+
+// ─── Loop (Core 1 — button polling + detection) ─────────────────────
+void loop() {
+  if (digitalRead(TRIGGER_BTN) == LOW && millis() - lastTrigger > 1000) {
+    lastTrigger   = millis();
+    buttonPressed = true;   // tell stream to pause
+    delay(150);             // give stream task time to pause
+
+    Serial.println("Button pressed! Detecting currency...");
+    detectCurrency();       // blocking — runs fully on Core 1
+
+    buttonPressed = false;  // stream resumes
+  }
+  delay(10);
+}
