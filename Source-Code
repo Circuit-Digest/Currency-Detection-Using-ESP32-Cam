@@ -1,21 +1,47 @@
+/*
+ * ESP32-CAM Currency Detection + Audio Announcement
+ * WITH WEB PREVIEW SERVER
+ *
+ * Changes from original:
+ *  1. Camera clarity: UXGA (1600×1200) with quality=8, plus sharpness/denoise tuning.
+ *  2. Web server on port 80:
+ *       /         → Dashboard with live MJPEG stream + last detection result
+ *       /stream   → Raw MJPEG stream (open in any browser tab or VLC)
+ *       /capture  → Single JPEG snapshot download
+ *       /status   → JSON with last currency result and heap info
+ *  3. Web server runs in a FreeRTOS task on Core 0.
+ *     detectCurrency() still runs on Core 1 (loop).
+ *  4. During detectCurrency(), camera is deinit'd briefly for RAM —
+ *     the stream task detects this and returns a 503 while detection runs.
+ */
+
 #include "esp_camera.h"
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
-#include <WebServer.h>
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
 
+// Audio libraries
+#include "AudioFileSourcePROGMEM.h"
+#include "AudioGeneratorMP3.h"
+#include "AudioOutputI2SNoDAC.h"
+
+// Web server
+#include <WebServer.h>
+
 // ─── Config ────────────────────────────────────────────────────────
-const char* WIFI_SSID  = "yourssidname";
-const char* WIFI_PASS  = "yourwifipasswprd";
-const char* API_KEY    = "yourapikey";
+const char* WIFI_SSID  = "Yourssidname";
+const char* WIFI_PASS  = "Yourwifiassword";
+const char* API_KEY    = "Yourapikey";
 const char* serverName = "www.circuitdigest.cloud";
 const char* serverPath = "/api/v1/currency-detection/detect";
 const int   serverPort = 443;
 
-#define TRIGGER_BTN 13
+// ─── Pins ──────────────────────────────────────────────────────────
+#define TRIGGER_BTN  12
+#define SPEAKER_PIN  13
 
-// ─── AI-Thinker ESP32-CAM Pins ─────────────────────────────────────
+// ─── AI-Thinker ESP32-CAM Camera Pins ─────────────────────────────
 #define PWDN_GPIO_NUM  32
 #define RESET_GPIO_NUM -1
 #define XCLK_GPIO_NUM   0
@@ -34,222 +60,600 @@ const int   serverPort = 443;
 #define PCLK_GPIO_NUM  22
 
 // ─── Globals ───────────────────────────────────────────────────────
-WiFiClientSecure  client;
-WebServer         previewServer(80);
-unsigned long     lastTrigger    = 0;
-volatile bool     buttonPressed  = false;  // pauses stream during detection
-SemaphoreHandle_t cameraMutex;
+static unsigned long  lastTrigger    = 0;
+static volatile bool  cameraActive   = true;  // false while deinit'd for detection
+static String         lastCurrency   = "None yet";
+
+static AudioOutputI2SNoDAC* g_audioOut = nullptr;
+static WebServer            webServer(80);
+
+// ─── Utility ───────────────────────────────────────────────────────
+static void printHeap(const char* tag) {
+  Serial.printf("[HEAP] %s  free=%u  maxBlock=%u  psram=%u\n",
+    tag,
+    (unsigned)ESP.getFreeHeap(),
+    (unsigned)ESP.getMaxAllocHeap(),
+    (unsigned)ESP.getFreePsram());
+}
 
 // ─── Camera Init ───────────────────────────────────────────────────
 void initCamera() {
+  pinMode(PWDN_GPIO_NUM, OUTPUT);
+  digitalWrite(PWDN_GPIO_NUM, HIGH); delay(100);
+  digitalWrite(PWDN_GPIO_NUM, LOW);  delay(100);
+
   camera_config_t cfg = {};
   cfg.ledc_channel = LEDC_CHANNEL_0; cfg.ledc_timer = LEDC_TIMER_0;
-  cfg.pin_d0 = Y2_GPIO_NUM;   cfg.pin_d1 = Y3_GPIO_NUM;
-  cfg.pin_d2 = Y4_GPIO_NUM;   cfg.pin_d3 = Y5_GPIO_NUM;
-  cfg.pin_d4 = Y6_GPIO_NUM;   cfg.pin_d5 = Y7_GPIO_NUM;
-  cfg.pin_d6 = Y8_GPIO_NUM;   cfg.pin_d7 = Y9_GPIO_NUM;
-  cfg.pin_xclk     = XCLK_GPIO_NUM;  cfg.pin_pclk     = PCLK_GPIO_NUM;
-  cfg.pin_vsync    = VSYNC_GPIO_NUM; cfg.pin_href     = HREF_GPIO_NUM;
-  cfg.pin_sscb_sda = SIOD_GPIO_NUM;  cfg.pin_sscb_scl = SIOC_GPIO_NUM;
-  cfg.pin_pwdn     = PWDN_GPIO_NUM;  cfg.pin_reset    = RESET_GPIO_NUM;
+  cfg.pin_d0=Y2_GPIO_NUM; cfg.pin_d1=Y3_GPIO_NUM; cfg.pin_d2=Y4_GPIO_NUM;
+  cfg.pin_d3=Y5_GPIO_NUM; cfg.pin_d4=Y6_GPIO_NUM; cfg.pin_d5=Y7_GPIO_NUM;
+  cfg.pin_d6=Y8_GPIO_NUM; cfg.pin_d7=Y9_GPIO_NUM;
+  cfg.pin_xclk=XCLK_GPIO_NUM; cfg.pin_pclk=PCLK_GPIO_NUM;
+  cfg.pin_vsync=VSYNC_GPIO_NUM; cfg.pin_href=HREF_GPIO_NUM;
+  cfg.pin_sscb_sda=SIOD_GPIO_NUM; cfg.pin_sscb_scl=SIOC_GPIO_NUM;
+  cfg.pin_pwdn=PWDN_GPIO_NUM; cfg.pin_reset=RESET_GPIO_NUM;
+
+  // Higher clock = sharper image, less motion blur
   cfg.xclk_freq_hz = 20000000;
   cfg.pixel_format = PIXFORMAT_JPEG;
-  cfg.frame_size   = FRAMESIZE_VGA;
-  cfg.jpeg_quality = 10;
-  cfg.fb_count     = 2;
 
-  if (esp_camera_init(&cfg) != ESP_OK) {
-    Serial.println("Camera init failed!"); while (1) delay(1000);
+  if (psramFound()) {
+    // ── CLARITY UPGRADE ──────────────────────────────────────────
+    // UXGA = 1600×1200 (was VGA 640×480)
+    // quality 8 = very high (was 12); lower number = more detail
+    // fb_count 2 keeps a spare frame ready while one is being sent
+    cfg.frame_size   = FRAMESIZE_UXGA;
+    cfg.jpeg_quality = 8;
+    cfg.fb_count     = 2;
+    cfg.fb_location  = CAMERA_FB_IN_PSRAM;
+  } else {
+    // No PSRAM fallback — SVGA is the best DRAM can handle reliably
+    cfg.frame_size   = FRAMESIZE_SVGA;
+    cfg.jpeg_quality = 10;
+    cfg.fb_count     = 1;
+    cfg.fb_location  = CAMERA_FB_IN_DRAM;
   }
+
+  esp_err_t err = esp_camera_init(&cfg);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed: 0x%x — restarting\n", err);
+    delay(1000); ESP.restart();
+  }
+
+  // ── SENSOR TUNING FOR CLARITY ────────────────────────────────
   sensor_t* s = esp_camera_sensor_get();
-  s->set_brightness(s, 1); s->set_contrast(s, 2);
-  s->set_saturation(s, 0); s->set_whitebal(s, 1);
-  s->set_exposure_ctrl(s, 1); s->set_gain_ctrl(s, 1);
-  s->set_aec2(s, 1); s->set_ae_level(s, 1);
-  Serial.println("Camera initialized.");
+  if (s) {
+    s->set_brightness(s, 1);      // +1 brightness (range -2..2)
+    s->set_contrast(s, 2);        // max contrast for crisp edges
+    s->set_saturation(s, 0);      // neutral saturation
+    s->set_sharpness(s, 2);       // max sharpness  ← NEW
+    s->set_denoise(s, 1);         // light denoise (reduces JPEG noise) ← NEW
+    s->set_whitebal(s, 1);        // auto white balance on
+    s->set_awb_gain(s, 1);        // AWB gain on      ← NEW
+    s->set_exposure_ctrl(s, 1);   // auto exposure on
+    s->set_gain_ctrl(s, 1);       // auto gain on
+    s->set_aec2(s, 1);            // AEC DSP on (better exposure in dark)
+    s->set_ae_level(s, 1);        // +1 AE bias (slightly brighter)
+    s->set_aec_value(s, 300);     // initial exposure hint ← NEW
+    s->set_agc_gain(s, 0);        // start at gain 0 (let auto take over)
+    s->set_gainceiling(s, (gainceiling_t)6); // max gain 128× ← NEW
+    s->set_bpc(s, 1);             // bad pixel correction on ← NEW
+    s->set_wpc(s, 1);             // white pixel correction on ← NEW
+    s->set_raw_gma(s, 1);         // gamma correction on ← NEW
+    s->set_lenc(s, 1);            // lens correction (fixes vignetting) ← NEW
+    s->set_hmirror(s, 0);
+    s->set_vflip(s, 0);
+    // Special: OV2640 DCW (down-sample) off gives sharper large frames
+    s->set_dcw(s, 0);             // ← NEW
+  }
+
+  cameraActive = true;
+  Serial.println("Camera initialized (UXGA, quality=8, full sensor tuning).");
 }
 
-// ─── Web Server Task (Core 0) ───────────────────────────────────────
-void webServerTask(void* param) {
-  while (true) {
-    previewServer.handleClient();
-    vTaskDelay(1);
+// ─── HTTP body reader ──────────────────────────────────────────────
+static size_t readBodyFixed(WiFiClientSecure& c, char* buf, size_t maxLen) {
+  size_t total = 0;
+  uint32_t t = millis();
+  while ((c.connected() || c.available()) && total < maxLen - 1) {
+    if (millis() - t > 8000) break;
+    if (!c.available()) { delay(10); continue; }
+    int n = c.read((uint8_t*)buf + total, maxLen - 1 - total);
+    if (n > 0) { total += n; t = millis(); }
+  }
+  buf[total] = '\0';
+  return total;
+}
+
+static void skipHeaders(WiFiClientSecure& c) {
+  while (c.connected()) {
+    String line = c.readStringUntil('\n');
+    if (line == "\r" || line.length() <= 1) break;
   }
 }
 
-// ─── Root Page ─────────────────────────────────────────────────────
-void handleRoot() {
-  previewServer.send(200, "text/html",
-    "<html><head>"
-    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-    "<script>"
-    "window.onload=function(){"
-    "  var img=document.getElementById('s');"
-    "  img.onerror=function(){setTimeout(function(){img.src='/stream?t='+Date.now();},3000);};"
-    "};"
-    "</script>"
-    "</head>"
-    "<body style='background:#000;text-align:center'>"
-    "<h2 style='color:#fff'>Currency Detection</h2>"
-    "<p style='color:#aaa'>Press the physical button to capture &amp; detect</p>"
-    "<img id='s' src='/stream' style='width:100%;max-width:640px'>"
-    "</body></html>"
-  );
-}
+// ─── Phase 2: Currency API ─────────────────────────────────────────
+static String sendImageToAPI(const uint8_t* buf, size_t len) {
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(15);
 
-// ─── MJPEG Stream (runs inside webServerTask on Core 0) ────────────
-void handleStream() {
-  WiFiClient streamClient = previewServer.client();
-  streamClient.println("HTTP/1.1 200 OK");
-  streamClient.println("Content-Type: multipart/x-mixed-replace; boundary=frame");
-  streamClient.println();
+  Serial.println("Connecting to currency API...");
+  printHeap("before API connect");
 
-  while (streamClient.connected()) {
-    // Pause stream while button detection is running (don't touch camera)
-    if (buttonPressed) {
-      vTaskDelay(100 / portTICK_PERIOD_MS);
-      continue;
-    }
-
-    if (xSemaphoreTake(cameraMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-      camera_fb_t* fb = esp_camera_fb_get();
-      xSemaphoreGive(cameraMutex);
-
-      if (fb) {
-        streamClient.println("--frame");
-        streamClient.println("Content-Type: image/jpeg");
-        streamClient.println("Content-Length: " + String(fb->len));
-        streamClient.println();
-        streamClient.write(fb->buf, fb->len);
-        streamClient.println();
-        esp_camera_fb_return(fb);
-      }
-    }
-    vTaskDelay(50 / portTICK_PERIOD_MS);  // ~20 fps
-  }
-}
-
-// ─── API Upload ─────────────────────────────────────────────────────
-String sendImageToAPI(camera_fb_t* fb) {
-  Serial.println("Connecting to server...");
-  if (!client.connect(serverName, serverPort)) {
-    Serial.println("Connection failed!");
-    return "Connection failed";
+  int retries = 0;
+  while (!client.connect(serverName, serverPort)) {
+    Serial.printf("Connection failed (attempt %d)\n", ++retries);
+    if (retries >= 3) return "Connection Error";
+    delay(1500);
   }
   Serial.println("Connected!");
 
-  String boundary  = "----ESP32Boundary";
-  String head      = "--" + boundary + "\r\n"
-                     "Content-Disposition: form-data; name=\"imageFile\"; filename=\"snap.jpg\"\r\n"
-                     "Content-Type: image/jpeg\r\n\r\n";
-  String tail      = "\r\n--" + boundary + "--\r\n";
-  int    contentLen = head.length() + fb->len + tail.length();
+  const char* bnd = "----ESP32Boundary";
+  char partHead[256];
+  int phLen = snprintf(partHead, sizeof(partHead),
+    "--%s\r\n"
+    "Content-Disposition: form-data; name=\"imageFile\"; filename=\"snap.jpg\"\r\n"
+    "Content-Type: image/jpeg\r\n\r\n", bnd);
 
-  client.println("POST " + String(serverPath) + " HTTP/1.1");
-  client.println("Host: " + String(serverName));
-  client.println("X-API-Key: " + String(API_KEY));
-  client.println("Content-Type: multipart/form-data; boundary=" + boundary);
-  client.println("Content-Length: " + String(contentLen));
-  client.println("Connection: close");
-  client.println();
-  client.print(head);
-  client.write(fb->buf, fb->len);
-  client.print(tail);
+  char partTail[64];
+  int ptLen = snprintf(partTail, sizeof(partTail), "\r\n--%s--\r\n", bnd);
+  size_t contentLen = phLen + len + ptLen;
+
+  client.printf(
+    "POST %s HTTP/1.1\r\n"
+    "Host: %s\r\n"
+    "X-API-Key: %s\r\n"
+    "Content-Type: multipart/form-data; boundary=%s\r\n"
+    "Content-Length: %u\r\n"
+    "Connection: close\r\n\r\n",
+    serverPath, serverName, API_KEY, bnd, (unsigned)contentLen);
+
+  client.write((const uint8_t*)partHead, phLen);
+  for (size_t off = 0; off < len; off += 1024) {
+    size_t sz = min((size_t)1024, len - off);
+    client.write(buf + off, sz);
+  }
+  client.write((const uint8_t*)partTail, ptLen);
 
   Serial.println("Image sent! Waiting for response...");
-  long t = millis();
-  while (!client.available()) {
-    if (millis() - t > 15000) { client.stop(); return "Timeout"; }
-    delay(10);
-  }
+  uint32_t t = millis();
+  while (!client.available() && millis() - t < 12000) delay(10);
+  skipHeaders(client);
 
-  String response = "";
-  while (client.connected() || client.available()) {
-    if (client.available()) response += (char)client.read();
-    else delay(1);
-  }
+  static char respBuf[1024];
+  readBodyFixed(client, respBuf, sizeof(respBuf));
   client.stop();
+  Serial.printf("API Response: %s\n", respBuf);
 
-  int j = response.indexOf("\r\n\r\n");
-  return (j != -1) ? response.substring(j + 4) : response;
+  String currency = "";
+  auto findField = [&](const char* key) -> String {
+    const char* p = strstr(respBuf, key);
+    if (!p) return "";
+    p += strlen(key);
+    const char* e = strchr(p, '"');
+    if (!e) return "";
+    return String(p).substring(0, e - p);
+  };
+
+  currency = findField("\"label\":\"");
+  if (currency == "") currency = findField("\"class\":\"");
+  if (currency == "") currency = findField("\"class_name\":\"");
+  if (currency == "") currency = findField("\"denomination\":\"");
+  if (currency == "" && (strstr(respBuf,"no_currency_found") || strstr(respBuf,"no_detections")))
+    currency = "No currency detected";
+  if (currency == "") currency = "Unknown currency";
+
+  const char* rupeeVals[] = {"10","20","50","100","200","500","2000"};
+  for (auto v : rupeeVals) if (currency == v) { currency += " rupees"; break; }
+
+  return currency;
 }
 
-// ─── Detect Currency (runs on Core 1 inside loop()) ─────────────────
-void detectCurrency() {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi disconnected! Reconnecting...");
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
-    int tries = 0;
-    while (WiFi.status() != WL_CONNECTED && tries < 20) {
-      delay(500); Serial.print("."); tries++;
-    }
-    if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("WiFi reconnect failed!"); return;
-    }
-    Serial.println("WiFi reconnected!");
+// ─── Phase 3: TTS Download ─────────────────────────────────────────
+static uint8_t* downloadTTS(const String& text, size_t* outLen) {
+  *outLen = 0;
+  String encoded = text;
+  encoded.replace(" ", "+");
+  String path = "/translate_tts?ie=UTF-8&q=" + encoded + "&tl=en&client=tw-ob";
+
+  WiFiClient httpClient;
+  if (!httpClient.connect("translate.google.com", 80)) {
+    Serial.println("[TTS] HTTP connect failed"); return nullptr;
+  }
+  httpClient.printf(
+    "GET %s HTTP/1.1\r\nHost: translate.google.com\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n",
+    path.c_str());
+
+  uint32_t t = millis();
+  while (!httpClient.available() && millis() - t < 8000) delay(10);
+
+  size_t contentLength = 0;
+  while (httpClient.connected()) {
+    String line = httpClient.readStringUntil('\n'); line.trim();
+    if (line.startsWith("Content-Length:")) contentLength = (size_t)line.substring(16).toInt();
+    if (line.length() == 0) break;
   }
 
-  // Take mutex — stream will pause (buttonPressed=true already set)
-  xSemaphoreTake(cameraMutex, portMAX_DELAY);
+  size_t bufCap = contentLength > 0 ? contentLength + 64 : 131072;
+  uint8_t* mp3buf = nullptr;
+  if (psramFound() && ESP.getFreePsram() > bufCap + 65536)
+    mp3buf = (uint8_t*)ps_malloc(bufCap);
+  if (!mp3buf) {
+    Serial.printf("[TTS] Cannot allocate %u bytes\n", (unsigned)bufCap);
+    httpClient.stop(); return nullptr;
+  }
 
-  // Warm-up frame — let AEC settle
+  size_t total = 0;
+  t = millis();
+  while ((httpClient.connected() || httpClient.available()) && total < bufCap) {
+    if (millis() - t > 15000) break;
+    if (!httpClient.available()) { delay(5); continue; }
+    int n = httpClient.read(mp3buf + total, bufCap - total);
+    if (n > 0) { total += n; t = millis(); }
+  }
+  httpClient.stop();
+
+  if (total == 0) { Serial.println("[TTS] No MP3 data"); free(mp3buf); return nullptr; }
+  Serial.printf("[TTS] Downloaded %u bytes\n", (unsigned)total);
+  *outLen = total;
+  return mp3buf;
+}
+
+// ─── Phase 4: Playback ─────────────────────────────────────────────
+static void playMP3(const uint8_t* mp3data, size_t mp3len) {
+  if (!mp3data || mp3len == 0) return;
+  printHeap("before playMP3");
+  AudioFileSourcePROGMEM* src = new AudioFileSourcePROGMEM(mp3data, mp3len);
+  AudioGeneratorMP3* mp3 = new AudioGeneratorMP3();
+  if (mp3->begin(src, g_audioOut)) {
+    while (mp3->isRunning()) { if (!mp3->loop()) mp3->stop(); }
+    Serial.println("[TTS] Playback complete.");
+  } else {
+    Serial.println("[TTS] MP3 begin() failed");
+  }
+  delete mp3; delete src;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// WEB SERVER — handlers
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Dashboard HTML ─────────────────────────────────────────────────
+static const char DASHBOARD_HTML[] PROGMEM = R"rawhtml(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP32-CAM Currency Detector</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;500&display=swap');
+  :root{
+    --bg:#0d0f14;--surface:#161a23;--accent:#f0c040;--accent2:#4af0a0;
+    --text:#e8eaf0;--muted:#6b7280;--border:#2a2f3d;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--text);font-family:'DM Sans',sans-serif;
+       min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:24px 16px}
+  header{width:100%;max-width:780px;display:flex;justify-content:space-between;
+         align-items:center;margin-bottom:28px;border-bottom:1px solid var(--border);padding-bottom:16px}
+  h1{font-family:'Space Mono',monospace;font-size:1.1rem;letter-spacing:.06em;color:var(--accent)}
+  .dot{width:8px;height:8px;border-radius:50%;background:var(--accent2);
+       box-shadow:0 0 8px var(--accent2);animation:pulse 2s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+  .card{width:100%;max-width:780px;background:var(--surface);border:1px solid var(--border);
+        border-radius:12px;overflow:hidden;margin-bottom:20px}
+  .stream-wrap{position:relative;width:100%;background:#000;aspect-ratio:4/3}
+  .stream-wrap img{width:100%;height:100%;object-fit:contain;display:block}
+  .overlay{position:absolute;top:10px;left:10px;background:rgba(0,0,0,.55);
+            backdrop-filter:blur(4px);padding:4px 10px;border-radius:6px;
+            font-family:'Space Mono',monospace;font-size:.7rem;color:var(--accent)}
+  .busy-banner{display:none;position:absolute;inset:0;background:rgba(13,15,20,.85);
+               align-items:center;justify-content:center;flex-direction:column;gap:12px}
+  .busy-banner.show{display:flex}
+  .spinner{width:40px;height:40px;border:3px solid var(--border);
+           border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .result-panel{padding:20px 24px;display:flex;align-items:center;gap:16px}
+  .label{font-family:'Space Mono',monospace;font-size:.65rem;color:var(--muted);
+         text-transform:uppercase;letter-spacing:.1em;margin-bottom:4px}
+  .currency{font-size:1.8rem;font-weight:500;color:var(--accent);letter-spacing:.02em}
+  .actions{display:flex;gap:10px;margin-left:auto}
+  button{background:transparent;border:1px solid var(--border);color:var(--text);
+         padding:8px 18px;border-radius:8px;cursor:pointer;font-family:'DM Sans',sans-serif;
+         font-size:.85rem;transition:all .2s}
+  button:hover{border-color:var(--accent);color:var(--accent)}
+  .meta{display:flex;gap:24px;padding:12px 24px;border-top:1px solid var(--border);
+        font-family:'Space Mono',monospace;font-size:.65rem;color:var(--muted)}
+  .meta span b{color:var(--accent2)}
+  a.raw{color:var(--muted);text-decoration:none;font-size:.75rem}
+  a.raw:hover{color:var(--accent)}
+</style>
+</head>
+<body>
+<header>
+  <h1>&#9654; Currency Detector</h1>
+  <div style="display:flex;align-items:center;gap:8px;font-size:.78rem;color:var(--muted)">
+    <div class="dot" id="statusDot"></div>
+    <span id="statusText">Live</span>
+  </div>
+</header>
+
+<div class="card">
+  <div class="stream-wrap">
+    <img id="streamImg" src="/capture" alt="Camera feed">
+    <div class="overlay">CAM</div>
+    <div class="busy-banner" id="busyBanner">
+      <div class="spinner"></div>
+      <span style="font-family:'Space Mono',monospace;font-size:.75rem;color:var(--accent)">
+        Detecting…
+      </span>
+    </div>
+  </div>
+  <div class="result-panel">
+    <div>
+      <div class="label">Last Detection</div>
+      <div class="currency" id="resultText">—</div>
+    </div>
+    <div class="actions">
+      <button onclick="snap()">Snapshot</button>
+      <a class="raw" href="/stream" target="_blank">
+        <button>Open Stream ↗</button>
+      </a>
+    </div>
+  </div>
+  <div class="meta" id="metaBar">
+    <span>Heap: <b id="heapFree">—</b></span>
+    <span>PSRAM: <b id="psramFree">—</b></span>
+    <span>Uptime: <b id="uptime">—</b></span>
+  </div>
+</div>
+
+<script>
+const streamImg  = document.getElementById('streamImg');
+const resultText = document.getElementById('resultText');
+const busyBanner = document.getElementById('busyBanner');
+let   streaming  = false;
+
+// Start MJPEG stream
+function startStream(){
+  streaming = true;
+  streamImg.src = '/stream?' + Date.now();
+}
+// Fallback: poll snapshot when stream breaks (e.g. during detection)
+function snapPoll(){
+  streaming = false;
+  streamImg.src = '/capture?' + Date.now();
+}
+
+streamImg.onerror = () => {
+  if(streaming){ snapPoll(); setTimeout(startStream, 3000); }
+};
+startStream();
+
+// Poll /status every 1.5 s
+async function pollStatus(){
+  try {
+    const r = await fetch('/status');
+    const d = await r.json();
+    resultText.textContent = d.currency || '—';
+    document.getElementById('heapFree').textContent  = fmtBytes(d.heap_free);
+    document.getElementById('psramFree').textContent = fmtBytes(d.psram_free);
+    document.getElementById('uptime').textContent    = fmtTime(d.uptime_s);
+    if(d.busy){
+      busyBanner.classList.add('show');
+      if(streaming){ snapPoll(); }
+    } else {
+      busyBanner.classList.remove('show');
+      if(!streaming){ startStream(); }
+    }
+  } catch(e){}
+}
+setInterval(pollStatus, 1500);
+pollStatus();
+
+function snap(){
+  const a = document.createElement('a');
+  a.href = '/capture?' + Date.now();
+  a.download = 'snapshot.jpg';
+  a.click();
+}
+
+function fmtBytes(b){ if(!b) return '—'; if(b>1048576) return (b/1048576).toFixed(1)+'MB'; return (b/1024).toFixed(0)+'KB'; }
+function fmtTime(s){ if(!s) return '—'; const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sec=s%60; return (h?h+'h ':'')+m+'m '+sec+'s'; }
+</script>
+</body>
+</html>
+)rawhtml";
+
+// ── Handler: dashboard ─────────────────────────────────────────────
+void handleRoot() {
+  webServer.send_P(200, "text/html", DASHBOARD_HTML);
+}
+
+// ── Handler: MJPEG stream ──────────────────────────────────────────
+void handleStream() {
+  if (!cameraActive) {
+    webServer.send(503, "text/plain", "Camera busy during detection");
+    return;
+  }
+
+  WiFiClient client = webServer.client();
+  client.print(
+    "HTTP/1.1 200 OK\r\n"
+    "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n"
+    "Cache-Control: no-cache\r\n"
+    "Connection: close\r\n\r\n");
+
+  while (client.connected()) {
+    if (!cameraActive) break;           // detection started — bail out
+
+    camera_fb_t* fb = esp_camera_fb_get();
+    if (!fb) { delay(30); continue; }
+
+    client.printf(
+      "--frame\r\n"
+      "Content-Type: image/jpeg\r\n"
+      "Content-Length: %u\r\n\r\n", (unsigned)fb->len);
+    client.write(fb->buf, fb->len);
+    client.print("\r\n");
+
+    esp_camera_fb_return(fb);
+    delay(50);  // ~20 fps cap — raise to 33ms for ~30 fps if your network handles it
+  }
+}
+
+// ── Handler: single snapshot ───────────────────────────────────────
+void handleCapture() {
+  if (!cameraActive) {
+    webServer.send(503, "text/plain", "Camera busy");
+    return;
+  }
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (!fb) { webServer.send(500, "text/plain", "Capture failed"); return; }
+
+  webServer.sendHeader("Content-Disposition", "inline; filename=\"snap.jpg\"");
+  webServer.sendHeader("Cache-Control", "no-cache");
+  webServer.send_P(200, "image/jpeg", (const char*)fb->buf, fb->len);
+  esp_camera_fb_return(fb);
+}
+
+// ── Handler: JSON status ───────────────────────────────────────────
+void handleStatus() {
+  char buf[256];
+  snprintf(buf, sizeof(buf),
+    "{\"currency\":\"%s\","
+    "\"busy\":%s,"
+    "\"heap_free\":%u,"
+    "\"psram_free\":%u,"
+    "\"uptime_s\":%lu}",
+    lastCurrency.c_str(),
+    cameraActive ? "false" : "true",
+    (unsigned)ESP.getFreeHeap(),
+    (unsigned)ESP.getFreePsram(),
+    millis() / 1000UL);
+  webServer.send(200, "application/json", buf);
+}
+
+// ── Web server task (Core 0) ───────────────────────────────────────
+static void webServerTask(void*) {
+  webServer.on("/",        handleRoot);
+  webServer.on("/stream",  handleStream);
+  webServer.on("/capture", handleCapture);
+  webServer.on("/status",  handleStatus);
+  webServer.begin();
+  Serial.println("[WEB] Server started on port 80");
+  for (;;) { webServer.handleClient(); delay(2); }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// DETECTION FLOW
+// ═══════════════════════════════════════════════════════════════════
+void detectCurrency() {
+  printHeap("detectCurrency start");
+
+  // Phase 1: Capture
   camera_fb_t* fb = esp_camera_fb_get();
   if (fb) esp_camera_fb_return(fb);
-  delay(200);
+  delay(250);
 
-  // Real capture
   fb = esp_camera_fb_get();
-  xSemaphoreGive(cameraMutex);
-
   if (!fb) { Serial.println("Capture failed!"); return; }
 
-  Serial.println("Photo captured! Sending to API...");
-  String result = sendImageToAPI(fb);
+  size_t imgLen = fb->len;
+  Serial.printf("Frame: %u bytes\n", (unsigned)imgLen);
+
+  uint8_t* imgBuf = nullptr;
+  if (psramFound() && ESP.getFreePsram() > imgLen + 65536)
+    imgBuf = (uint8_t*)ps_malloc(imgLen);
+  if (!imgBuf && ESP.getMaxAllocHeap() > imgLen + 32768)
+    imgBuf = (uint8_t*)malloc(imgLen);
+
+  if (!imgBuf) {
+    Serial.println("No memory for frame!");
+    esp_camera_fb_return(fb);
+    return;
+  }
+  memcpy(imgBuf, fb->buf, imgLen);
   esp_camera_fb_return(fb);
 
-  Serial.println("=== Currency Detection Result ===");
-  Serial.println(result);
-  Serial.println("================================");
+  // Deinit camera — signal web task to stop streaming
+  cameraActive = false;
+  delay(50);             // let any in-flight stream handler finish its current frame
+  esp_camera_deinit();
+  delay(150);
+  printHeap("after cam deinit");
+
+  // Phase 2: API
+  String currency = sendImageToAPI(imgBuf, imgLen);
+  free(imgBuf);
+  lastCurrency = currency;
+
+  Serial.println("=== Detection Result ===");
+  Serial.println(currency);
+  Serial.println("========================");
+
+  printHeap("after API, before TTS download");
+
+  // Phase 3: Download TTS
+  size_t mp3Len = 0;
+  uint8_t* mp3Buf = downloadTTS(currency, &mp3Len);
+
+  // Phase 4: Play
+  if (mp3Buf) { playMP3(mp3Buf, mp3Len); free(mp3Buf); }
+  else         { Serial.println("[TTS] Skipping audio (download failed)"); }
+
+  // Reinit camera and re-enable stream
+  initCamera();
+  cameraActive = true;
+  printHeap("detectCurrency end");
 }
 
-// ─── Setup ──────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════
+// SETUP / LOOP
+// ═══════════════════════════════════════════════════════════════════
 void setup() {
-  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // Disable brownout detector
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
   Serial.begin(115200);
   delay(500);
 
-  cameraMutex = xSemaphoreCreateMutex();
   pinMode(TRIGGER_BTN, INPUT_PULLUP);
-
   initCamera();
 
-  client.setInsecure();  // skip TLS cert check
+  g_audioOut = new AudioOutputI2SNoDAC();
+  g_audioOut->SetPinout(14, 15, SPEAKER_PIN);
 
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   Serial.print("Connecting to WiFi");
   while (!WiFi.isConnected()) { delay(500); Serial.print("."); }
-  Serial.println("\nConnected: " + WiFi.localIP().toString());
-  Serial.println("Preview at: http://" + WiFi.localIP().toString());
+  Serial.printf("\nConnected: %s\n", WiFi.localIP().toString().c_str());
 
-  previewServer.on("/",       handleRoot);
-  previewServer.on("/stream", handleStream);
-  previewServer.begin();
+  // Print the URL prominently
+  Serial.println("─────────────────────────────────────────");
+  Serial.printf("  WEB PREVIEW → http://%s\n", WiFi.localIP().toString().c_str());
+  Serial.printf("  MJPEG STREAM → http://%s/stream\n", WiFi.localIP().toString().c_str());
+  Serial.println("─────────────────────────────────────────");
 
-  // Web server + stream on Core 0; loop() on Core 1
-  xTaskCreatePinnedToCore(webServerTask, "webTask", 8192, NULL, 1, NULL, 0);
+  configTime(19800, 0, "pool.ntp.org", "time.nist.gov");
+  Serial.print("Syncing time");
+  for (int i = 0; i < 20 && time(nullptr) < 100000; i++) { delay(500); Serial.print("."); }
+  Serial.println(time(nullptr) > 100000 ? "\nTime synced!" : "\nTime sync timeout");
+
+  // Start web server on Core 0 (loop runs on Core 1 by default)
+  xTaskCreatePinnedToCore(webServerTask, "WebSrv", 8192, nullptr, 1, nullptr, 0);
+
+  printHeap("setup complete");
+  Serial.println("Ready — press button to detect currency.");
 }
 
-// ─── Loop (Core 1 — button polling + detection) ─────────────────────
 void loop() {
-  if (digitalRead(TRIGGER_BTN) == LOW && millis() - lastTrigger > 1000) {
-    lastTrigger   = millis();
-    buttonPressed = true;   // tell stream to pause
-    delay(150);             // give stream task time to pause
-
+  if (digitalRead(TRIGGER_BTN) == LOW && millis() - lastTrigger > 2000) {
+    lastTrigger = millis();
+    delay(150);
     Serial.println("Button pressed! Detecting currency...");
-    detectCurrency();       // blocking — runs fully on Core 1
-
-    buttonPressed = false;  // stream resumes
+    detectCurrency();
   }
   delay(10);
 }
