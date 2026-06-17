@@ -101,6 +101,7 @@ Slightly damaged notes may work if visible properly.
 
 - CircuitDigest Cloud: https://circuitdigest.cloud
 - GitHub Repository: https://github.com/Circuit-Digest/Currency-Detection-Using-ESP32-Cam
+- https://circuitdigest.com/microcontroller-projects/esp32-cam-indian-currency-recognition
 
 ---
 
